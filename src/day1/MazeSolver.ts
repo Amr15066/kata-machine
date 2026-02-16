@@ -1,20 +1,50 @@
-const dir = [
-    { x: 0, y: -1 }, // up
-    { x: 1, y: 0 },  // right
-    { x: 0, y: 1 },  // down
-    { x: -1, y: 0 }  // left
-];
+const dir: [
+   [0,-1],
+   [1,0],
+   [0,1],
+   [-1,0]
+]
 
+function walk(maze: string[], wall: string, curr: Point, end: Point, path: Point[], seen: Boolean[][]): boolean {
+    // base cases
+    //if it leaves the map
+    if (curr.x < 0 || curr.x >= maze[0].length ||
+        curr.y < 0 || curr.y >= maze.length){
+            return false
+        }
+    
+    if (maze[curr.y][curr.x]=== wall){
+        return false 
+    }
+    
+    if (curr.x === end.x && curr.y === end.y){
+        path.push(end)
+        return true
+    }
 
-function walk(maze:): boolean {
-    /*we need to consider base case first
-    imagine a block, we can go up down lefto r right, so that is the loop, RECURSIVE NOT BASE
-    what we can do iis check if it is out of bounds
-    check if it is a wall
-    check if it is the end
-    check if it is already visited
-    */
+    if (seen[curr.y][curr.x]){
+        return false
+    }
+
+    //Pre recursion phase
+
+    path.push(curr)
+    seen[curr.y][curr.x] = true
+
+    // recursion phase
+    for (let i = 0; i < dir.length; i++){
+        const [x,y] = dir[i]
+        walk(maze, wall, {x: curr.x + x, y: curr.y+y})
+    }
+
 }
 export default function solve(maze: string[], wall: string, start: Point, end: Point): Point[] {
+    const seen: boolean[][]=[];
+    const path: Point[] = [] ;
+    for (let i = 0; i < maze.length; i++){
+        seen.push(new Array(maze[i].length).fill(false));
+    }
+    walk(maze, wall, end, start, path, seen);
+    return path;
 
 }
