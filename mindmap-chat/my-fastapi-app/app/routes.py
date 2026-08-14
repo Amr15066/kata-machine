@@ -137,13 +137,14 @@ async def create_new_mindmap(payload: StartConversationRequest):
     # Use manager to start conversation (this creates the graph structure)
     response_text = mgr.start_new_conversation(payload.topic)
     
-    # Get the current graph (just created)
-    mindmap = get_storage().load()
-    graph = mindmap.graphs.get(mindmap.current_graph_id)
+    # Reuse the manager's in-memory state. Reloading here meant a second full
+    # read of the entire corpus plus a second full write, per request.
+    mindmap = mgr.mindmap
+    graph = mgr.graph
     root_block = graph.blocks.get(graph.root_block_id)
 
     # Ensure the root node title matches the user-provided topic
-    if root_block and payload.topic:
+    if root_block and payload.topic and root_block.title != payload.topic:
         root_block.title = payload.topic
         get_storage().save(mindmap)
     
@@ -308,11 +309,14 @@ async def add_message_to_block(block_id: str, payload: MessageRequest, backgroun
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
     
-    # Save updated graph
-    get_storage().save(mindmap)
-    
-    # Get updated messages for this block
-    messages = graph.get_block_messages(block_id)
+    # continue_conversation() already saved; saving again here rewrote the whole
+    # corpus a second time for no benefit.
+
+    # The manager may have moved to a different block (deepen / new_child), so
+    # report the block the messages actually landed in.
+    graph = mgr.graph
+    target_block_id = graph.current_block_id or block_id
+    messages = graph.get_block_messages(target_block_id)
     messages_list = [
         {
             "message_id": msg.message_id,
@@ -324,9 +328,11 @@ async def add_message_to_block(block_id: str, payload: MessageRequest, backgroun
     ]
     
     return {
-        "block_id": block_id,
+        "block_id": target_block_id,
         "messages": messages_list,
-        "current_block_id": block_id,
+        "current_block_id": target_block_id,
+        "graph": graph.to_d3_graph(),
+        "assistant_response": response_text,
     }
 
 
@@ -384,9 +390,9 @@ async def delete_block(block_id: str):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # Reload updated mindmap after deletion
-    mindmap = get_storage().load()
-    graph = mindmap.graphs.get(mindmap.current_graph_id)
+    # delete_block() saved already; reuse the in-memory state instead of a
+    # third full load of the corpus.
+    graph = mgr.graph
     if not graph:
         raise HTTPException(status_code=500, detail="No active graph after delete")
 

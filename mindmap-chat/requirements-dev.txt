@@ -1,0 +1,5 @@
+# Dev/test dependencies. The test suite runs fully offline against
+# llm.fake.FakeLLMClient and needs no API key.
+-r requirements.txt
+pytest>=7.4
+pytest-cov>=4.1

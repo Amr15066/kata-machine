@@ -6,6 +6,15 @@ Allows easy swapping of different LLM providers.
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Embeddings are asymmetric: a question and the document that answers it should
+# be embedded with different task types, or cosine similarity compares the wrong
+# things. Providers that do not support this simply ignore the argument.
+TASK_QUERY = "RETRIEVAL_QUERY"
+TASK_DOCUMENT = "RETRIEVAL_DOCUMENT"
 
 
 class LLMClient(ABC):
@@ -26,12 +35,14 @@ class LLMClient(ABC):
         pass
 
     @abstractmethod
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, task_type: str = TASK_DOCUMENT) -> list[float]:
         """
         Generate an embedding for text.
         
         Args:
             text: Text to embed
+            task_type: Retrieval role of this text (TASK_QUERY for a live user
+                message, TASK_DOCUMENT for stored block intents)
             
         Returns:
             Embedding vector
@@ -63,7 +74,7 @@ class LLMClient(ABC):
             repaired = _repair_json_payload(response)
             if repaired is not None:
                 return json.loads(repaired)
-            print(f"Failed to parse JSON response: {response}")
+            logger.error("Failed to parse JSON response: %s", response)
             raise
 
 def _extract_json_payload(response: str) -> Optional[str]:

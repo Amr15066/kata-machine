@@ -3,11 +3,33 @@ Core data structures for the mindmap chat system.
 These are JSON-serializable and represent the conversation graph.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from typing import List, Optional, Dict, Any
 import uuid
 import json
 from datetime import datetime
+
+
+def _only_known_fields(cls: type, data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Drop keys that are not fields of ``cls``.
+
+    Persisted JSON outlives the code that wrote it. Without this, adding or
+    removing a field makes every previously saved conversation unloadable.
+    """
+    if not isinstance(data, dict):
+        return {}
+    known = {f.name for f in dataclass_fields(cls)}
+    return {k: v for k, v in data.items() if k in known}
+
+
+# The classifier emits actions ("new_child"); the renderer speaks relation names
+# ("child"). Keep the translation in one place so they cannot drift apart.
+RELATION_ALIASES = {
+    "new_child": "child",
+    "new-child": "child",
+    "root": "child",
+}
 
 
 @dataclass
@@ -25,7 +47,7 @@ class ConversationMessage:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ConversationMessage":
-        return cls(**data)
+        return cls(**_only_known_fields(cls, data))
 
 
 @dataclass
@@ -35,6 +57,10 @@ class Block:
     parent_block_id: Optional[str] = None
     title: str = ""
     intent: str = ""
+    # How this block relates to its parent. Set from BlockClassification.action
+    # at creation time so the graph can render real relation semantics.
+    relation: str = "child"
+    relation_confidence: float = 0.8
     summary: str = ""
     key_points: List[str] = field(default_factory=list)
     open_questions: List[str] = field(default_factory=list)
@@ -42,13 +68,16 @@ class Block:
     embedding: List[float] = field(default_factory=list)  # Intent embedding
     children: List[str] = field(default_factory=list)
     conversation_refs: List[str] = field(default_factory=list)  # message_ids
+    # Number of messages the current summary was generated from. Lets us
+    # re-summarize as a block grows instead of summarizing once and never again.
+    summarized_at_message_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Block":
-        return cls(**data)
+        return cls(**_only_known_fields(cls, data))
 
     def add_message_ref(self, message_id: str):
         """Add a message ID reference to this block."""
@@ -202,24 +231,28 @@ class ConversationGraph:
                 "is_current": block_id == self.current_block_id,
             })
         
-        # Build links from parent-child relationships
-        # Infer relation type from metadata (default to "child")
+        # Build links from parent-child relationships using the relation that was
+        # actually classified when the block was created.
         for block_id, block in self.blocks.items():
             if block.parent_block_id:
-                # Default to "child" relation with 0.8 confidence
-                relation = "child"
-                confidence = 0.8
-                
-                color = relation_colors.get(relation, relation_colors["child"])
-                weight = relation_weights.get(relation, relation_weights["child"])
-                
+                relation = RELATION_ALIASES.get(block.relation, block.relation)
+                if relation not in relation_colors:
+                    relation = "child"
+
+                confidence = block.relation_confidence
+                try:
+                    confidence = float(confidence)
+                except (TypeError, ValueError):
+                    confidence = 0.8
+                confidence = min(max(confidence, 0.0), 1.0)
+
                 links.append({
                     "source": block.parent_block_id,
                     "target": block_id,
                     "relation": relation,
                     "confidence": confidence,
-                    "color": color,
-                    "strokeWidth": weight,
+                    "color": relation_colors[relation],
+                    "strokeWidth": relation_weights[relation],
                 })
         
         return {

@@ -6,10 +6,14 @@ Atomic writes with file locking to prevent corruption.
 
 import json
 import os
+import logging
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from models import ConversationGraph, Mindmap
+
+logger = logging.getLogger(__name__)
 
 
 class JSONStorage:
@@ -24,7 +28,7 @@ class JSONStorage:
         """
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()  # Thread-safe writes
+        self._lock = RLock()  # Thread-safe read-modify-write
 
     def save(self, mindmap: Mindmap) -> None:
         """
@@ -34,56 +38,97 @@ class JSONStorage:
         Args:
             mindmap: Mindmap to save
         """
-        data = mindmap.to_dict()
-        
         with self._lock:
-            # Write to temporary file in same directory (ensures same filesystem)
-            temp_fd, temp_path = tempfile.mkstemp(
-                dir=self.file_path.parent,
-                prefix=".tmp_",
-                suffix=".json"
-            )
-            try:
-                with os.fdopen(temp_fd, "w") as f:
-                    json.dump(data, f, indent=2)
-                
-                # Atomic rename (all-or-nothing on most filesystems)
-                os.replace(temp_path, self.file_path)
-                print(f"[SAVED] {self.file_path}")
-            except Exception as e:
-                # Clean up temp file on error
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise e
+            self._save_unlocked(mindmap)
+
+    def _save_unlocked(self, mindmap: Mindmap) -> None:
+        """Atomic write. Caller must already hold ``self._lock``."""
+        data = mindmap.to_dict()
+
+        # Write to temporary file in same directory (ensures same filesystem)
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=self.file_path.parent,
+            prefix=".tmp_",
+            suffix=".json"
+        )
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Atomic rename (all-or-nothing on most filesystems)
+            os.replace(temp_path, self.file_path)
+            logger.debug("Saved mindmap to %s", self.file_path)
+        except Exception:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+    @contextmanager
+    def transaction(self):
+        """
+        Hold the lock across the whole read-modify-write cycle.
+
+        ``load()`` then ``save()`` as separate calls each take the lock
+        individually, so two concurrent writers can interleave and silently
+        drop one another's changes. Mutating inside this context makes the
+        cycle atomic with respect to other users of this instance.
+
+            with storage.transaction() as mindmap:
+                mindmap.add_graph(graph)
+        """
+        with self._lock:
+            mindmap = self._load_unlocked()
+            yield mindmap
+            self._save_unlocked(mindmap)
 
     def load(self) -> Mindmap:
         """
         Load conversation graph from JSON file (thread-safe).
         
+        Handles both the current multi-graph format and the legacy
+        single-graph format.
+
         Returns:
             Loaded Mindmap, or empty mindmap if file doesn't exist
         """
         with self._lock:
-            if not self.file_path.exists():
-                return Mindmap()
-            
-            try:
-                with open(self.file_path, "r") as f:
-                    data = json.load(f)
-            except json.JSONDecodeError:
-                print(f"[ERROR] Corrupted JSON in {self.file_path}, returning empty mindmap")
-                return Mindmap()
-            
-            if "graphs" in data:
-                mindmap = Mindmap.from_dict(data)
-            for graph in mindmap.graphs.values():
-                graph.rebuild_children()
-            return mindmap
+            return self._load_unlocked()
 
-        graph = ConversationGraph.from_dict(data)
-        graph.rebuild_children()
-        mindmap = Mindmap()
-        mindmap.add_graph(graph)
+    def _load_unlocked(self) -> Mindmap:
+        """Load without taking the lock. Caller must already hold it."""
+        if not self.file_path.exists():
+            return Mindmap()
+
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            logger.error(
+                "Corrupted JSON in %s, returning empty mindmap", self.file_path
+            )
+            return Mindmap()
+
+        if not isinstance(data, dict):
+            logger.error(
+                "Unexpected JSON root (%s) in %s, returning empty mindmap",
+                type(data).__name__,
+                self.file_path,
+            )
+            return Mindmap()
+
+        if "graphs" in data:
+            mindmap = Mindmap.from_dict(data)
+        else:
+            # Legacy single-graph format: promote it into a Mindmap.
+            graph = ConversationGraph.from_dict(data)
+            mindmap = Mindmap()
+            mindmap.add_graph(graph)
+
+        for graph in mindmap.graphs.values():
+            graph.rebuild_children()
         return mindmap
 
     def clear(self) -> None:
@@ -91,4 +136,4 @@ class JSONStorage:
         with self._lock:
             if self.file_path.exists():
                 os.remove(self.file_path)
-                print(f"[CLEARED] {self.file_path}")
+                logger.info("Cleared %s", self.file_path)

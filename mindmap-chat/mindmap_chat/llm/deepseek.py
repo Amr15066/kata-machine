@@ -3,17 +3,14 @@ DeepSeek API client implementation.
 Uses DeepSeek for generation (answering) but Gemini for embeddings (cheap).
 """
 
+import logging
 import requests
-import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-try:
-    import google.genai as genai
-except ImportError:
-    import google.generativeai as genai
-
-from .base import LLMClient
+from .base import LLMClient, TASK_DOCUMENT
 from config import config
+
+logger = logging.getLogger(__name__)
 
 
 class DeepSeekClient(LLMClient):
@@ -22,12 +19,17 @@ class DeepSeekClient(LLMClient):
     def __init__(self):
         """Initialize DeepSeek client."""
         self.api_key = config.deepseek.api_key
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY is not set")
+
         self.model_name = config.deepseek.model_name
         self.base_url = "https://api.deepseek.com/chat/completions"
-        
-        # Keep Gemini for cheap embeddings
-        genai.configure(api_key=config.gemini.api_key)
-        self.embedding_model = "text-embedding-004"
+
+        # Reuse the Gemini client purely for embeddings, rather than configuring
+        # a second SDK by hand.
+        from .gemini import GeminiClient
+
+        self._embedder = GeminiClient()
 
     def call(self, prompt: str, json_mode: bool = False) -> str:
         """
@@ -62,22 +64,23 @@ class DeepSeekClient(LLMClient):
             response = requests.post(self.base_url, json=payload, headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            raise Exception(f"DeepSeek API error: {e}")
+        except requests.RequestException as e:
+            raise RuntimeError(f"DeepSeek API error: {e}") from e
 
-    def embed(self, text: str) -> list[float]:
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"DeepSeek returned no choices: {data}")
+        return choices[0]["message"]["content"]
+
+    def embed(self, text: str, task_type: str = TASK_DOCUMENT) -> List[float]:
         """
         Generate embedding using Gemini (cheap, token-efficient).
         
         Args:
             text: Text to embed
+            task_type: Retrieval role of this text
             
         Returns:
             Embedding vector
         """
-        result = genai.embed_content(
-            model=self.embedding_model,
-            content=text
-        )
-        return result["embedding"]
+        return self._embedder.embed(text, task_type=task_type)

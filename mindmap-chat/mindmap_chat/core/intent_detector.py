@@ -3,17 +3,35 @@ Intent shift detection.
 Determines if new message continues, deepens, or diverges from current block.
 """
 
-from typing import Optional
+from __future__ import annotations
+
 import json
-from llm.base import LLMClient
+import logging
+from typing import List, Optional
+
+from llm.base import LLMClient, TASK_QUERY
 from llm import prompts
 from models import Block, BlockClassification, ConversationMessage
 from core.embeddings import compute_similarity, embed_text
 from config import config
 
+logger = logging.getLogger(__name__)
 
-def detect_intent_shift(llm_client: LLMClient, current_block: Block, 
-                       new_user_msg: str, last_messages: list[ConversationMessage]) -> BlockClassification:
+ACTION_MAP = {
+    "CONTINUE": "continue",
+    "DEEPEN": "deepen",
+    "NEW_CHILD": "new_child",
+    "TANGENT": "tangent",
+}
+
+
+def detect_intent_shift(
+    llm_client: LLMClient,
+    current_block: Block,
+    new_user_msg: str,
+    last_messages: List[ConversationMessage],
+    message_embedding: Optional[List[float]] = None,
+) -> BlockClassification:
     """
     Detect if the new message represents an intent shift.
     
@@ -24,16 +42,19 @@ def detect_intent_shift(llm_client: LLMClient, current_block: Block,
         current_block: The current block
         new_user_msg: The new user message
         last_messages: Recent messages (for context)
+        message_embedding: Precomputed embedding of ``new_user_msg``. Passing it
+            avoids embedding the same message twice in one turn.
         
     Returns:
         BlockClassification with action and reasoning
     """
     
-    # Step 1: Embed the new message
-    new_msg_embedding = embed_text(llm_client, new_user_msg)
+    # Step 1: Embed the new message (reuse if the caller already did)
+    if message_embedding is None:
+        message_embedding = embed_text(llm_client, new_user_msg, task_type=TASK_QUERY)
     
     # Step 2: Compare similarity to current block intent
-    intent_similarity = compute_similarity(new_msg_embedding, current_block.embedding)
+    intent_similarity = compute_similarity(message_embedding, current_block.embedding)
     
     # Step 3: Make decision based on thresholds
     thresholds = config.thresholds
@@ -46,30 +67,51 @@ def detect_intent_shift(llm_client: LLMClient, current_block: Block,
             reasoning=f"Message aligns strongly with block intent (similarity: {intent_similarity:.2f})"
         )
     
-    elif intent_similarity >= thresholds.deepen_threshold:
+    if intent_similarity >= thresholds.deepen_threshold:
         # Medium-high similarity: deeper dive
         return BlockClassification(
             action="deepen",
             confidence=intent_similarity,
             reasoning=f"Message deepens the current topic (similarity: {intent_similarity:.2f})"
         )
-    
-    elif intent_similarity < thresholds.tangent_threshold:
-        # Low similarity: likely tangent or new topic
-        # Ask LLM for confirmation
-        return _classify_with_llm(
-            llm_client, current_block, new_user_msg, last_messages
-        )
-    
+
+    # Below deepen_threshold the embedding alone cannot decide, so ask the LLM.
+    # The band still matters: it sets what we fall back to when the LLM is
+    # unavailable or returns garbage. Previously both branches were identical
+    # and always fell back to "continue", which pinned genuinely unrelated
+    # messages onto the current block.
+    if intent_similarity < thresholds.tangent_threshold:
+        fallback_action = "tangent"
+        band = "likely tangent"
     else:
-        # Medium similarity: ambiguous, ask LLM
-        return _classify_with_llm(
-            llm_client, current_block, new_user_msg, last_messages
-        )
+        fallback_action = "new_child"
+        band = "ambiguous"
+
+    logger.debug(
+        "Similarity %.3f is %s; escalating to LLM (fallback=%s)",
+        intent_similarity,
+        band,
+        fallback_action,
+    )
+
+    return _classify_with_llm(
+        llm_client,
+        current_block,
+        new_user_msg,
+        last_messages,
+        fallback_action=fallback_action,
+        similarity=intent_similarity,
+    )
 
 
-def _classify_with_llm(llm_client: LLMClient, current_block: Block, 
-                       new_user_msg: str, last_messages: list[ConversationMessage]) -> BlockClassification:
+def _classify_with_llm(
+    llm_client: LLMClient,
+    current_block: Block,
+    new_user_msg: str,
+    last_messages: List[ConversationMessage],
+    fallback_action: str = "continue",
+    similarity: float = 0.0,
+) -> BlockClassification:
     """
     Use LLM to classify intent shift when embedding similarity is ambiguous.
     """
@@ -78,7 +120,6 @@ def _classify_with_llm(llm_client: LLMClient, current_block: Block,
     last_user = last_messages[-2].content if len(last_messages) >= 2 else "(first message)"
     last_assistant = last_messages[-1].content if last_messages else "(no response yet)"
     
-    # Get classification from LLM
     base_prompt = prompts.prompt_classify_intent_shift(
         current_block.title,
         current_block.intent,
@@ -87,88 +128,65 @@ def _classify_with_llm(llm_client: LLMClient, current_block: Block,
         last_assistant,
         new_user_msg
     )
-    
-    try:
-        response_json = llm_client.call_json(base_prompt)
-        
-        # Map LLM response to our action enum
-        llm_action = response_json.get("classification", "").upper()
-        action_map = {
-            "CONTINUE": "continue",
-            "DEEPEN": "deepen",
-            "NEW_CHILD": "new_child",
-            "TANGENT": "tangent",
-        }
-        
-        action = action_map.get(llm_action, "continue")
 
-        new_blocks = _parse_new_blocks(response_json)
-        if not new_blocks:
-            legacy_title = response_json.get("new_block_title")
-            legacy_intent = response_json.get("new_block_intent")
-            if legacy_title or legacy_intent:
-                new_blocks = [{
-                    "title": legacy_title or "Untitled",
-                    "intent": legacy_intent or "New discussion",
-                }]
-        
-        return BlockClassification(
-            action=action,
-            confidence=float(response_json.get("confidence", 0.5)),
-            reasoning=response_json.get("reasoning", ""),
-            new_block_title=response_json.get("new_block_title"),
-            new_block_intent=response_json.get("new_block_intent"),
-            new_blocks=new_blocks
-        )
-    
-    except json.JSONDecodeError:
-        retry_prompt = (
-            base_prompt
-            + "\n\nReminder: Return a single valid JSON object only. No extra text."
-        )
+    retry_prompt = (
+        base_prompt
+        + "\n\nReminder: Return a single valid JSON object only. No extra text."
+    )
+
+    for attempt, prompt in enumerate((base_prompt, retry_prompt), start=1):
         try:
-            response_json = llm_client.call_json(retry_prompt)
-            llm_action = response_json.get("classification", "").upper()
-            action_map = {
-                "CONTINUE": "continue",
-                "DEEPEN": "deepen",
-                "NEW_CHILD": "new_child",
-                "TANGENT": "tangent",
-            }
-            action = action_map.get(llm_action, "continue")
-            new_blocks = _parse_new_blocks(response_json)
-            if not new_blocks:
-                legacy_title = response_json.get("new_block_title")
-                legacy_intent = response_json.get("new_block_intent")
-                if legacy_title or legacy_intent:
-                    new_blocks = [{
-                        "title": legacy_title or "Untitled",
-                        "intent": legacy_intent or "New discussion",
-                    }]
-            return BlockClassification(
-                action=action,
-                confidence=float(response_json.get("confidence", 0.5)),
-                reasoning=response_json.get("reasoning", ""),
-                new_block_title=response_json.get("new_block_title"),
-                new_block_intent=response_json.get("new_block_intent"),
-                new_blocks=new_blocks
-            )
+            return _build_classification(llm_client.call_json(prompt))
+        except json.JSONDecodeError:
+            if attempt == 1:
+                logger.warning("Classifier returned invalid JSON; retrying once")
+                continue
+            logger.error("Classifier returned invalid JSON twice; using fallback")
         except Exception as e:
-            print(f"Error in LLM classification: {e}")
-            return BlockClassification(
-                action="continue",
-                confidence=0.5,
-                reasoning="Fallback classification due to LLM error"
-            )
-    
-    except Exception as e:
-        print(f"Error in LLM classification: {e}")
-        # Fallback
-        return BlockClassification(
-            action="continue",
-            confidence=0.5,
-            reasoning="Fallback classification due to LLM error"
-        )
+            logger.error("Error in LLM classification: %s", e)
+            break
+
+    return BlockClassification(
+        action=fallback_action,
+        confidence=similarity,
+        reasoning=(
+            f"Fallback classification (similarity: {similarity:.2f}); "
+            "LLM classification unavailable"
+        ),
+    )
+
+
+def _build_classification(response_json: dict) -> BlockClassification:
+    """Map a raw classifier response onto a BlockClassification."""
+    llm_action = str(response_json.get("classification", "")).upper()
+    action = ACTION_MAP.get(llm_action, "continue")
+
+    new_blocks = _parse_new_blocks(response_json)
+    if not new_blocks:
+        legacy_title = response_json.get("new_block_title")
+        legacy_intent = response_json.get("new_block_intent")
+        if legacy_title or legacy_intent:
+            new_blocks = [{
+                "title": legacy_title or "Untitled",
+                "intent": legacy_intent or "New discussion",
+            }]
+
+    try:
+        confidence = float(response_json.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = min(max(confidence, 0.0), 1.0)
+
+    return BlockClassification(
+        action=action,
+        confidence=confidence,
+        reasoning=response_json.get("reasoning", ""),
+        new_block_title=response_json.get("new_block_title"),
+        new_block_intent=response_json.get("new_block_intent"),
+        new_blocks=new_blocks,
+    )
+
+
 def _parse_new_blocks(response_json: dict) -> list[dict]:
     new_blocks = []
     for item in response_json.get("new_blocks", []) or []:

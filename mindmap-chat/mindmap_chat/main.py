@@ -5,11 +5,21 @@ Main entry point: Interactive CLI for the mindmap chat system.
 from dotenv import load_dotenv
 load_dotenv()
 
+import logging
+import os
 import sys
 from config import config, validate_config
 from llm.gemini import GeminiClient
 from storage import JSONStorage
 from conversation import ConversationManager
+
+# Progress reporting moved from print() to logging. Configure a handler here so
+# the CLI stays as chatty as it was; set MINDMAP_LOG_LEVEL=DEBUG for more.
+logging.basicConfig(
+    level=os.getenv("MINDMAP_LOG_LEVEL", "INFO").upper(),
+    format="%(message)s",
+    stream=sys.stdout,
+)
 
 
 def print_help():

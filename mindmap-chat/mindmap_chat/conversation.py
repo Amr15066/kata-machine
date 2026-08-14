@@ -4,8 +4,9 @@ Ties together all modules for the core functionality.
 """
 
 from typing import Optional
+import logging
 import re
-from llm.base import LLMClient
+from llm.base import LLMClient, TASK_QUERY, TASK_DOCUMENT
 from llm import prompts
 from models import ConversationGraph, ConversationMessage, Block, Mindmap, BlockClassification
 from core import (
@@ -20,6 +21,8 @@ from core import (
 from config import config
 from storage import JSONStorage
 from utils import print_block_tree
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationManager:
@@ -79,7 +82,7 @@ class ConversationManager:
         # Save
         self.storage.save(self.mindmap)
         
-        print(f"\n[OK] Started new conversation: '{root_block.title}'")
+        logger.info("Started new conversation: '%s'", root_block.title)
         return response
 
     def continue_conversation(self, user_message: str) -> str:
@@ -100,17 +103,26 @@ class ConversationManager:
         # Get recent messages for context
         block_messages = self.graph.get_block_messages(current_block.block_id)
         
+        # Embed the user message exactly once and reuse it for both intent
+        # detection and cross-graph matching.
+        user_embedding = embed_text(self.llm, user_message, task_type=TASK_QUERY)
+
         # Detect intent shift
-        print(f"\n[Analyzing intent...]")
+        logger.info("Analyzing intent")
         classification = detect_intent_shift(
             self.llm,
             current_block,
             user_message,
-            block_messages
+            block_messages,
+            message_embedding=user_embedding,
         )
         
-        print(f"  [ACTION] {classification.action} (confidence: {classification.confidence:.2f})")
-        print(f"  [REASON] {classification.reasoning}")
+        logger.info(
+            "Action=%s confidence=%.2f reason=%s",
+            classification.action,
+            classification.confidence,
+            classification.reasoning,
+        )
         
         # Handle classification
         if classification.action == "continue":
@@ -120,12 +132,18 @@ class ConversationManager:
         elif classification.action == "deepen":
             # Create child block(s) for a deeper dive
             new_blocks = self._resolve_deepen_blocks(classification, current_block, user_message)
-            created_blocks = self._create_child_blocks(current_block, new_blocks)
+            created_blocks = self._create_child_blocks(
+                current_block, new_blocks,
+                relation="deepen",
+                relation_confidence=classification.confidence,
+            )
             target_block = created_blocks[0]
             self.graph.current_block_id = target_block.block_id
 
         elif classification.action == "tangent":
-            matched = self._find_matching_block_in_other_graphs(user_message)
+            matched = self._find_matching_block_in_other_graphs(
+                user_message, user_embedding=user_embedding
+            )
             if matched:
                 matched_graph, matched_block, similarity = matched
                 if similarity >= config.thresholds.continue_threshold:
@@ -133,9 +151,9 @@ class ConversationManager:
                     self.mindmap.current_graph_id = matched_graph.graph_id
                     self.graph.current_block_id = matched_block.block_id
                     target_block = matched_block
-                    print(
-                        f"  [MATCH] Redirected tangent to '{matched_block.title}' "
-                        f"(similarity: {similarity:.2f})"
+                    logger.info(
+                        "Redirected tangent to '%s' (similarity: %.2f)",
+                        matched_block.title, similarity,
                     )
                 else:
                     self.graph = matched_graph
@@ -149,12 +167,14 @@ class ConversationManager:
                     created_blocks = self._create_child_blocks(
                         matched_block,
                         new_blocks,
+                        relation="sibling",
+                        relation_confidence=similarity,
                     )
                     target_block = created_blocks[0]
                     self.graph.current_block_id = target_block.block_id
-                    print(
-                        f"  [MATCH] Created child under '{matched_block.title}' "
-                        f"(similarity: {similarity:.2f})"
+                    logger.info(
+                        "Created child under '%s' (similarity: %.2f)",
+                        matched_block.title, similarity,
                     )
             else:
                 # Start a new graph with this message as the root block
@@ -176,7 +196,11 @@ class ConversationManager:
             if not new_blocks:
                 new_blocks = [{"title": "Untitled", "intent": "New discussion"}]
 
-            created_blocks = self._create_child_blocks(current_block, new_blocks)
+            created_blocks = self._create_child_blocks(
+                current_block, new_blocks,
+                relation="child",
+                relation_confidence=classification.confidence,
+            )
             target_block = created_blocks[0]
             self.graph.current_block_id = target_block.block_id
         
@@ -224,18 +248,17 @@ class ConversationManager:
         Returns:
             Assistant response
         """
-        # Construct block-scoped context
+        # Construct block-scoped context once. The original built it twice per
+        # turn (and discarded a hand-rolled prompt immediately after building it).
         context = construct_block_context(self.graph, block)
-        
-        # Build full prompt
-        prompt = context + f"\nUSER: {user_message}\n\nASSISTANT:"
+
         prompt = prompts.prompt_answer_in_block_context(
             block.title,
             block.intent,
             block.summary or "(discussion just started)",
             "\n".join(f"- {kp}" for kp in block.key_points) if block.key_points else "(none yet)",
             "\n".join(f"- {oq}" for oq in block.open_questions) if block.open_questions else "(none yet)",
-            construct_block_context(self.graph, block),
+            context,
             user_message
         )
         
@@ -279,7 +302,7 @@ class ConversationManager:
                         "intent": intent or "New discussion",
                     })
         except Exception as exc:
-            print(f"  [WARN] Could not expand deepen blocks: {exc}")
+            logger.warning("Could not expand deepen blocks: %s", exc)
 
         if not new_blocks:
             new_blocks = [{
@@ -289,7 +312,13 @@ class ConversationManager:
 
         return new_blocks
 
-    def _create_child_blocks(self, parent_block: Block, new_blocks: list[dict[str, str]]) -> list[Block]:
+    def _create_child_blocks(
+        self,
+        parent_block: Block,
+        new_blocks: list[dict[str, str]],
+        relation: str = "child",
+        relation_confidence: float = 0.8,
+    ) -> list[Block]:
         created_blocks = []
         for block_seed in new_blocks:
             new_block = create_child_block(
@@ -297,32 +326,56 @@ class ConversationManager:
                 parent_block,
                 block_seed.get("title", "Untitled"),
                 block_seed.get("intent", "New discussion"),
+                relation=relation,
+                relation_confidence=relation_confidence,
             )
             self.graph.add_block(new_block)
             created_blocks.append(new_block)
-            print(f"  [NEW] Created new block: '{new_block.title}'")
+            logger.info("Created new block: '%s' (relation=%s)", new_block.title, relation)
         return created_blocks
     
    
     def _find_matching_block_in_other_graphs(
         self,
         user_message: str,
+        user_embedding: Optional[list[float]] = None,
     ) -> Optional[tuple[ConversationGraph, Block, float]]:
         if not self.graph:
             return None
 
-        user_embedding = embed_text(self.llm, user_message)
+        if user_embedding is None:
+            user_embedding = embed_text(self.llm, user_message, task_type=TASK_QUERY)
+
         best_match: Optional[tuple[ConversationGraph, Block, float]] = None
 
-        for graph_id, graph in self.mindmap.graphs.items():
+        # Blocks missing an embedding used to trigger a network call from inside
+        # this nested loop, making a single tangent cost one API round-trip per
+        # un-embedded block. Collect them instead and backfill afterwards.
+        missing_embeddings: list[Block] = []
+
+        for graph in self.mindmap.graphs.values():
             for block in graph.blocks.values():
                 if not block.intent:
                     continue
                 if not block.embedding:
-                    block.embedding = embed_text(self.llm, block.intent)
+                    missing_embeddings.append(block)
+                    continue
                 similarity = compute_similarity(user_embedding, block.embedding)
                 if best_match is None or similarity > best_match[2]:
                     best_match = (graph, block, similarity)
+
+        if missing_embeddings:
+            logger.info("Backfilling embeddings for %d block(s)", len(missing_embeddings))
+            for graph in self.mindmap.graphs.values():
+                for block in graph.blocks.values():
+                    if block not in missing_embeddings:
+                        continue
+                    block.embedding = embed_text(
+                        self.llm, block.intent, task_type=TASK_DOCUMENT
+                    )
+                    similarity = compute_similarity(user_embedding, block.embedding)
+                    if best_match is None or similarity > best_match[2]:
+                        best_match = (graph, block, similarity)
 
         if best_match and best_match[2] >= config.thresholds.sibling_threshold:
             return best_match

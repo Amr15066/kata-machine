@@ -1,7 +1,15 @@
+import logging
 import os
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+# The engine reports progress via logging rather than print, so give it a
+# handler here too. Uvicorn configures its own loggers but not ours.
+logging.basicConfig(
+    level=os.getenv("MINDMAP_LOG_LEVEL", "INFO").upper(),
+    format="%(levelname)s:%(name)s:%(message)s",
+)
 
 
 # Get base directory

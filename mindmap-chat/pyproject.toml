@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mindmap-chat"
+version = "0.2.0"
+description = "A chat interface that structures a conversation as a navigable mindmap instead of a linear transcript."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "jinja2>=3.1.0",
+    "google-genai>=0.3.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+# The legacy SDK is only needed if you pin to google-generativeai instead.
+legacy-sdk = ["google-generativeai>=0.3.0"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[tool.setuptools]
+# The package uses top-level absolute imports (`from models import ...`), so
+# mindmap_chat/ acts as the source root rather than an importable package.
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["mindmap_chat"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["mindmap_chat"]
+omit = ["*/llm/fake.py"]
